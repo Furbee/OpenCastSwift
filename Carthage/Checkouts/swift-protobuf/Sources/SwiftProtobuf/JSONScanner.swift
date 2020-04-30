@@ -1,6 +1,6 @@
 // Sources/SwiftProtobuf/JSONScanner.swift - JSON format decoding
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the project authors
+// Copyright (c) 2014 - 2019 Apple Inc. and the project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See LICENSE.txt for license information:
@@ -80,8 +80,11 @@ private func fromHexDigit(_ c: UnicodeScalar) -> UInt32? {
   }
 }
 
-// Decode both the RFC 4648 section 4 Base 64 encoding and the
-// RFC 4648 section 5 Base 64 variant.
+// Decode both the RFC 4648 section 4 Base 64 encoding and the RFC
+// 4648 section 5 Base 64 variant.  The section 5 variant is also
+// known as "base64url" or the "URL-safe alphabet".
+// Note that both "-" and "+" decode to 62 and "/" and "_" both
+// decode as 63.
 let base64Values: [Int] = [
 /* 0x00 */ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 /* 0x10 */ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -113,9 +116,9 @@ let base64Values: [Int] = [
 ///    Base 64 encoding and the "URL and Filename Safe Alphabet" variant.
 ///
 private func parseBytes(
-  source: UnsafeBufferPointer<UInt8>,
-  index: inout UnsafeBufferPointer<UInt8>.Index,
-  end: UnsafeBufferPointer<UInt8>.Index
+  source: UnsafeRawBufferPointer,
+  index: inout UnsafeRawBufferPointer.Index,
+  end: UnsafeRawBufferPointer.Index
 ) throws -> Data {
     let c = source[index]
     if c != asciiDoubleQuote {
@@ -124,17 +127,39 @@ private func parseBytes(
     source.formIndex(after: &index)
 
     // Count the base-64 digits
-    // Ignore unrecognized characters in this first pass,
+    // Ignore most unrecognized characters in this first pass,
     // stop at the closing double quote.
     let digitsStart = index
     var rawChars = 0
     var sawSection4Characters = false
     var sawSection5Characters = false
     while index != end {
-        let digit = source[index]
+        var digit = source[index]
         if digit == asciiDoubleQuote {
             break
-        } else if digit == asciiPlus || digit == asciiForwardSlash {
+        }
+
+        if digit == asciiBackslash {
+            source.formIndex(after: &index)
+            if index == end {
+                throw JSONDecodingError.malformedString
+            }
+            let escaped = source[index]
+            switch escaped {
+            case asciiLowerU:
+                // TODO: Parse hex escapes such as \u0041.  Note that
+                // such escapes are going to be extremely rare, so
+                // there's little point in optimizing for them.
+                throw JSONDecodingError.malformedString
+            case asciiForwardSlash:
+                digit = escaped
+            default:
+                // Reject \b \f \n \r \t \" or \\ and all illegal escapes
+                throw JSONDecodingError.malformedString
+            }
+        }
+
+        if digit == asciiPlus || digit == asciiForwardSlash {
             sawSection4Characters = true
         } else if digit == asciiMinus || digit == asciiUnderscore {
             sawSection5Characters = true
@@ -165,38 +190,36 @@ private func parseBytes(
     // a closing double quote.
     index = digitsStart
     try value.withUnsafeMutableBytes {
-        (dataPointer: UnsafeMutablePointer<UInt8>) in
-        var p = dataPointer
+        (body: UnsafeMutableRawBufferPointer) in
+      if var p = body.baseAddress, body.count > 0 {
         var n = 0
         var chars = 0 // # chars in current group
         var padding = 0 // # padding '=' chars
         digits: while true {
             let digit = source[index]
-            let k = base64Values[Int(digit)]
-            if k >= 0 {
-                n <<= 6
-                n |= k
-                chars += 1
-                if chars == 4 {
-                    p[0] = UInt8(truncatingIfNeeded: n >> 16)
-                    p[1] = UInt8(truncatingIfNeeded: n >> 8)
-                    p[2] = UInt8(truncatingIfNeeded: n)
-                    p += 3
-                    chars = 0
-                    n = 0
-                }
-            } else {
+            var k = base64Values[Int(digit)]
+            if k < 0 {
                 switch digit {
                 case asciiDoubleQuote:
-                    source.formIndex(after: &index)
                     break digits
+                case asciiBackslash:
+                    source.formIndex(after: &index)
+                    let escaped = source[index]
+                    switch escaped {
+                    case asciiForwardSlash:
+                        k = base64Values[Int(escaped)]
+                    default:
+                        // Note: Invalid backslash escapes were caught
+                        // above; we should never get here.
+                        throw JSONDecodingError.malformedString
+                    }
                 case asciiSpace:
-                    break
+                    source.formIndex(after: &index)
+                    continue digits
                 case asciiEqualSign: // Count padding
                     while true {
                         switch source[index] {
                         case asciiDoubleQuote:
-                            source.formIndex(after: &index)
                             break digits
                         case asciiSpace:
                             break
@@ -210,6 +233,17 @@ private func parseBytes(
                 default:
                     throw JSONDecodingError.malformedString
                 }
+            }
+            n <<= 6
+            n |= k
+            chars += 1
+            if chars == 4 {
+                p[0] = UInt8(truncatingIfNeeded: n >> 16)
+                p[1] = UInt8(truncatingIfNeeded: n >> 8)
+                p[2] = UInt8(truncatingIfNeeded: n)
+                p += 3
+                chars = 0
+                n = 0
             }
             source.formIndex(after: &index)
         }
@@ -233,7 +267,9 @@ private func parseBytes(
             break
         }
         throw JSONDecodingError.malformedString
+      }
     }
+    source.formIndex(after: &index)
     return value
 }
 
@@ -335,11 +371,12 @@ private func decodeString(_ s: String) -> String? {
 /// For performance, it works directly against UTF-8 bytes in memory.
 ///
 internal struct JSONScanner {
-  private let source: UnsafeBufferPointer<UInt8>
-  private var index: UnsafeBufferPointer<UInt8>.Index
-  private var numberFormatter = DoubleFormatter()
+  private let source: UnsafeRawBufferPointer
+  private var index: UnsafeRawBufferPointer.Index
+  private var numberParser = DoubleParser()
   internal var recursionLimit: Int
   internal var recursionBudget: Int
+  private var ignoreUnknownFields: Bool
 
   /// True if the scanner has read all of the data from the source, with the
   /// exception of any trailing whitespace (which is consumed by reading this
@@ -361,11 +398,16 @@ internal struct JSONScanner {
     return source[index]
   }
 
-  internal init(source: UnsafeBufferPointer<UInt8>, messageDepthLimit: Int) {
+  internal init(
+    source: UnsafeRawBufferPointer,
+    messageDepthLimit: Int,
+    ignoreUnknownFields: Bool
+  ) {
     self.source = source
     self.index = source.startIndex
     self.recursionLimit = messageDepthLimit
     self.recursionBudget = messageDepthLimit
+    self.ignoreUnknownFields = ignoreUnknownFields
   }
 
   private mutating func incrementRecursionDepth() throws {
@@ -441,9 +483,9 @@ internal struct JSONScanner {
   // is used by callers that are parsing quoted numbers.  See nextSInt()
   // and nextUInt() below.
   private func parseBareUInt64(
-    source: UnsafeBufferPointer<UInt8>,
-    index: inout UnsafeBufferPointer<UInt8>.Index,
-    end: UnsafeBufferPointer<UInt8>.Index
+    source: UnsafeRawBufferPointer,
+    index: inout UnsafeRawBufferPointer.Index,
+    end: UnsafeRawBufferPointer.Index
   ) throws -> UInt64? {
     if index == end {
       throw JSONDecodingError.truncated
@@ -526,9 +568,9 @@ internal struct JSONScanner {
   // UTF8 directly, only falling back to a full String decode when
   // absolutely necessary.
   private func parseBareSInt64(
-    source: UnsafeBufferPointer<UInt8>,
-    index: inout UnsafeBufferPointer<UInt8>.Index,
-    end: UnsafeBufferPointer<UInt8>.Index
+    source: UnsafeRawBufferPointer,
+    index: inout UnsafeRawBufferPointer.Index,
+    end: UnsafeRawBufferPointer.Index
   ) throws -> Int64? {
     if index == end {
       throw JSONDecodingError.truncated
@@ -580,9 +622,9 @@ internal struct JSONScanner {
   // It's also used by the slow path in parseBareSInt64() and parseBareUInt64()
   // above to handle integer values that are written in float-point notation.
   private func parseBareDouble(
-    source: UnsafeBufferPointer<UInt8>,
-    index: inout UnsafeBufferPointer<UInt8>.Index,
-    end: UnsafeBufferPointer<UInt8>.Index
+    source: UnsafeRawBufferPointer,
+    index: inout UnsafeRawBufferPointer.Index,
+    end: UnsafeRawBufferPointer.Index
   ) throws -> Double? {
     // RFC 7159 defines the grammar for JSON numbers as:
     // number = [ minus ] int [ frac ] [ exp ]
@@ -636,7 +678,7 @@ internal struct JSONScanner {
       while c >= asciiZero && c <= asciiNine {
         source.formIndex(after: &index)
         if index == end {
-          if let d = numberFormatter.utf8ToDouble(bytes: source, start: start, end: index) {
+          if let d = numberParser.utf8ToDouble(bytes: source, start: start, end: index) {
             return d
           } else {
             throw JSONDecodingError.invalidUTF8
@@ -665,7 +707,7 @@ internal struct JSONScanner {
         while c >= asciiZero && c <= asciiNine {
           source.formIndex(after: &index)
           if index == end {
-            if let d = numberFormatter.utf8ToDouble(bytes: source, start: start, end: index) {
+            if let d = numberParser.utf8ToDouble(bytes: source, start: start, end: index) {
               return d
             } else {
               throw JSONDecodingError.invalidUTF8
@@ -711,7 +753,7 @@ internal struct JSONScanner {
         while c >= asciiZero && c <= asciiNine {
           source.formIndex(after: &index)
           if index == end {
-            if let d = numberFormatter.utf8ToDouble(bytes: source, start: start, end: index) {
+            if let d = numberParser.utf8ToDouble(bytes: source, start: start, end: index) {
               return d
             } else {
               throw JSONDecodingError.invalidUTF8
@@ -727,7 +769,7 @@ internal struct JSONScanner {
         throw JSONDecodingError.malformedNumber
       }
     }
-    if let d = numberFormatter.utf8ToDouble(bytes: source, start: start, end: index) {
+    if let d = numberParser.utf8ToDouble(bytes: source, start: start, end: index) {
       return d
     } else {
       throw JSONDecodingError.invalidUTF8
@@ -806,15 +848,16 @@ internal struct JSONScanner {
         let s = try nextQuotedString()
         let raw = s.data(using: String.Encoding.utf8)!
         let n = try raw.withUnsafeBytes {
-          (bytes: UnsafePointer<UInt8>) -> UInt64? in
-          let buffer = UnsafeBufferPointer(start: bytes, count: raw.count)
-          var index = buffer.startIndex
-          let end = buffer.endIndex
-          if let u = try parseBareUInt64(source: buffer,
-                                         index: &index,
-                                         end: end) {
-            if index == end {
-              return u
+          (body: UnsafeRawBufferPointer) -> UInt64? in
+          if body.count > 0 {
+            var index = body.startIndex
+            let end = body.endIndex
+            if let u = try parseBareUInt64(source: body,
+                                           index: &index,
+                                           end: end) {
+              if index == end {
+                return u
+              }
             }
           }
           return nil
@@ -865,15 +908,16 @@ internal struct JSONScanner {
         let s = try nextQuotedString()
         let raw = s.data(using: String.Encoding.utf8)!
         let n = try raw.withUnsafeBytes {
-          (bytes: UnsafePointer<UInt8>) -> Int64? in
-          let buffer = UnsafeBufferPointer(start: bytes, count: raw.count)
-          var index = buffer.startIndex
-          let end = buffer.endIndex
-          if let s = try parseBareSInt64(source: buffer,
-                                         index: &index,
-                                         end: end) {
-            if index == end {
-              return s
+          (body: UnsafeRawBufferPointer) -> Int64? in
+          if body.count > 0 {
+            var index = body.startIndex
+            let end = body.endIndex
+            if let s = try parseBareSInt64(source: body,
+                                           index: &index,
+                                           end: end) {
+              if index == end {
+                return s
+              }
             }
           }
           return nil
@@ -929,16 +973,17 @@ internal struct JSONScanner {
         default:
           let raw = s.data(using: String.Encoding.utf8)!
           let n = try raw.withUnsafeBytes {
-            (bytes: UnsafePointer<UInt8>) -> Float? in
-            let buffer = UnsafeBufferPointer(start: bytes, count: raw.count)
-            var index = buffer.startIndex
-            let end = buffer.endIndex
-            if let d = try parseBareDouble(source: buffer,
-                                           index: &index,
-                                           end: end) {
-              let f = Float(d)
-              if index == end && f.isFinite {
-                return f
+            (body: UnsafeRawBufferPointer) -> Float? in
+            if body.count > 0 {
+              var index = body.startIndex
+              let end = body.endIndex
+              if let d = try parseBareDouble(source: body,
+                                             index: &index,
+                                             end: end) {
+                let f = Float(d)
+                if index == end && f.isFinite {
+                  return f
+                }
               }
             }
             return nil
@@ -1000,15 +1045,16 @@ internal struct JSONScanner {
         default:
           let raw = s.data(using: String.Encoding.utf8)!
           let n = try raw.withUnsafeBytes {
-            (bytes: UnsafePointer<UInt8>) -> Double? in
-            let buffer = UnsafeBufferPointer(start: bytes, count: raw.count)
-            var index = buffer.startIndex
-            let end = buffer.endIndex
-            if let d = try parseBareDouble(source: buffer,
-                                           index: &index,
-                                           end: end) {
-              if index == end {
-                return d
+            (body: UnsafeRawBufferPointer) -> Double? in
+            if body.count > 0 {
+              var index = body.startIndex
+              let end = body.endIndex
+              if let d = try parseBareDouble(source: body,
+                                             index: &index,
+                                             end: end) {
+                if index == end {
+                  return d
+                }
               }
             }
             return nil
@@ -1170,7 +1216,7 @@ internal struct JSONScanner {
   /// Returns pointer/count spanning the UTF8 bytes of the next regular
   /// key or nil if the key contains a backslash (and therefore requires
   /// the full string-parsing logic to properly parse).
-  private mutating func nextOptionalKey() throws -> UnsafeBufferPointer<UInt8>? {
+  private mutating func nextOptionalKey() throws -> UnsafeRawBufferPointer? {
     skipWhitespace()
     let stringStart = index
     guard hasMoreContent else {
@@ -1191,7 +1237,7 @@ internal struct JSONScanner {
     guard hasMoreContent else {
       throw JSONDecodingError.truncated
     }
-    let buff = UnsafeBufferPointer<UInt8>(
+    let buff = UnsafeRawBufferPointer(
       start: source.baseAddress! + nameStart,
       count: index - nameStart)
     advance()
@@ -1212,12 +1258,19 @@ internal struct JSONScanner {
         if let fieldNumber = names.number(forJSONName: key) {
           return fieldNumber
         }
+        if !ignoreUnknownFields {
+          let fieldName = utf8ToString(bytes: key.baseAddress!, count: key.count)!
+          throw JSONDecodingError.unknownField(fieldName)
+        }
       } else {
         // Slow path:  We parsed a String; lookups from String are slower.
         let key = try nextQuotedString()
         try skipRequiredCharacter(asciiColon) // :
         if let fieldNumber = names.number(forJSONName: key) {
           return fieldNumber
+        }
+        if !ignoreUnknownFields {
+          throw JSONDecodingError.unknownField(key)
         }
       }
       // Unknown field, skip it and try to parse the next field name

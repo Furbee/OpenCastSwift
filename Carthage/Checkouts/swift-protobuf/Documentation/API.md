@@ -60,7 +60,7 @@ public struct Example: SwiftProtobuf.Message {
   //    $0.field1 = 7
   //    $0.field2 = ["foo", "bar"]
   // }
-  static public with(_ configurator: (inout Example) -> ());
+  public static with(_ configurator: (inout Example) -> ());
 
   // Messages can be serialized or deserialized to Data objects
   // using protobuf binary format.
@@ -115,7 +115,7 @@ For example,
 ```
 will by default generate a struct named `MyCompany_CoolProject_FooBar`
 with another `Baz` struct nested inside it.
-Note that `Baz` is not prefixed.
+Note that `Baz` is not prefixed because it will be scoped to the parent type.
 
 You can change the prefix with the `option swift_prefix` statement
 in your proto file:
@@ -133,33 +133,21 @@ will generate a struct named `MyFooBar`.
 :warning: The `swift_prefix` option has proven problematic in practice.
 Because it ignores the `package` directive, it can easily lead to name
 conflicts and other confusion as your shared proto definitions evolve over
-time.
+time. For example, say you have a file that defines "User" and/or "Settings",
+that will work great without the package prefix until you use a second proto
+file that defined a different "User" and/or "Settings". Protocol buffers solved
+this by having the `package` in the first place, so by overriding that with a
+custom Swift prefix makes you that much more likely to have collisions in the
+future. If you are considering a prefix just to make the type names
+_shorter_/_nicer_, then instead consider using a Swift `typealias` within your
+source to remap the names locally where they are used, but keeping the richer
+name for the full build to thus avoid the conflicts.
 
 If the resulting name would collide with a Swift reserved word
 or would otherwise cause problems in the generated code,
 then the word `Message` is appended to the name.
 For example, a `message Int` in the proto file will cause the
 generator to emit a `struct IntMessage` to the generated Swift file.
-
-### Overridable Message methods
-
-You can redefine the following in manually-constructed extensions if you
-want to override the default generated behavior for any reason:
-
-```swift
-  // By default, this just calls `serializedText()`
-  public var debugDescription: String
-
-  // By default, this computes a simple hash over all of the
-  // defined fields and submessages.
-  public var hashValue: Int
-
-  // The == operator is implemented in terms of this method
-  // so that you can easily override the implementation.
-  // You may override this method, but you should never call it directly.
-  // The default generated implementation compares every field for equality.
-  public func isEqualTo(message: Example) -> Bool
-```
 
 ## Enum API
 

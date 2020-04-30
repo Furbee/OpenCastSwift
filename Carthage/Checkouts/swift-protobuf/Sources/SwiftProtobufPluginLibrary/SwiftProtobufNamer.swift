@@ -86,9 +86,9 @@ public final class SwiftProtobufNamer {
   private func computeRelativeNames(enum e: EnumDescriptor) {
     let stripper = NamingUtils.PrefixStripper(prefix: e.name)
 
-    /// Determine the initial canidate name for the name before
+    /// Determine the initial candidate name for the name before
     /// doing duplicate checks.
-    func canidateName(_ enumValue: EnumValueDescriptor) -> String {
+    func candidateName(_ enumValue: EnumValueDescriptor) -> String {
       let baseName = enumValue.name
       if let stripped = stripper.strip(from: baseName) {
         let camelCased = NamingUtils.toLowerCamelCase(stripped)
@@ -100,20 +100,13 @@ public final class SwiftProtobufNamer {
     }
 
     // Bucketed based on candidate names to check for duplicates.
-    var canidates = [String:[EnumValueDescriptor]]()
+    var candidates = [String:[EnumValueDescriptor]]()
     for enumValue in e.values {
-      let canidate = canidateName(enumValue)
-
-      if var existing = canidates[canidate] {
-        existing.append(enumValue)
-        canidates[canidate] = existing
-      } else {
-        canidates[canidate] = [enumValue]
-      }
-
+      let candidate = candidateName(enumValue)
+      candidates[candidate, default:[]].append(enumValue)
     }
 
-    for (camelCased, enumValues) in canidates {
+    for (camelCased, enumValues) in candidates {
       // If there is only one, sanitize and cache it.
       guard enumValues.count > 1 else {
         enumValueRelativeNameCache[enumValues.first!.fullName] =
@@ -180,10 +173,23 @@ public final class SwiftProtobufNamer {
   /// api pov.
   public func uniquelyNamedValues(enum e: EnumDescriptor) -> [EnumValueDescriptor] {
     return e.values.filter {
+      // Original are kept as is. The computations for relative
+      // name already adds values for collisions with different
+      // values.
       guard let aliasOf = $0.aliasOf else { return true }
       let relativeName = self.relativeName(enumValue: $0)
       let aliasOfRelativeName = self.relativeName(enumValue: aliasOf)
-      return relativeName != aliasOfRelativeName
+      // If the relative name matches for the alias and original, drop
+      // the alias.
+      guard relativeName != aliasOfRelativeName else { return false }
+      // Only include this alias if it is the first one with this name.
+      // (handles alias with different cases in their names that get
+      // mangled to a single Swift name.)
+      let firstAlias = aliasOf.aliases.firstIndex {
+        let otherRelativeName = self.relativeName(enumValue: $0)
+        return relativeName == otherRelativeName
+      }
+      return aliasOf.aliases[firstAlias!] === $0
     }
   }
 

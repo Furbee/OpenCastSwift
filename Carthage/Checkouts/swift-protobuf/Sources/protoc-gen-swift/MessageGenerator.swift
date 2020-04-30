@@ -53,7 +53,7 @@ class MessageGenerator {
     // when the message has one or more oneof{}s. As that will efficively
     // reduce the real number of fields and the message might not need heap
     // storage yet.
-    let useHeapStorage = isAnyMessage || descriptor.fields.count > 16 || hasSingleMessageField(descriptor: descriptor)
+    let useHeapStorage = isAnyMessage || descriptor.fields.count > 16 || hasRecursiveSingularField(descriptor: descriptor)
 
     oneofs = descriptor.oneofs.map {
       return OneofGenerator(descriptor: $0, generatorOptions: generatorOptions, namer: namer, usesHeapStorage: useHeapStorage)
@@ -188,6 +188,15 @@ class MessageGenerator {
     p.print("}\n")
   }
 
+  func generateEnumCaseIterable(printer p: inout CodePrinter) {
+    for e in enums {
+      e.generateCaseIterable(printer: &p, includeGuards: false)
+    }
+    for m in messages {
+      m.generateEnumCaseIterable(printer: &p)
+    }
+  }
+
   func generateRuntimeSupport(printer p: inout CodePrinter, file: FileGenerator, parent: MessageGenerator?) {
     p.print(
         "\n",
@@ -215,7 +224,7 @@ class MessageGenerator {
     p.print("\n")
     generateTraverse(printer: &p)
     p.print("\n")
-    generateMessageImplementationBase(printer: &p)
+    generateMessageEquality(printer: &p)
     p.outdent()
     p.print("}\n")
 
@@ -339,22 +348,23 @@ class MessageGenerator {
     p.print("}\n")
   }
 
-  private func generateMessageImplementationBase(printer p: inout CodePrinter) {
-    p.print("\(visibility)func _protobuf_generated_isEqualTo(other: \(swiftFullName)) -> Bool {\n")
+  private func generateMessageEquality(printer p: inout CodePrinter) {
+    p.print("\(visibility)static func ==(lhs: \(swiftFullName), rhs: \(swiftFullName)) -> Bool {\n")
     p.indent()
     var compareFields = true
     if let storage = storage {
-      p.print("if _storage !== other._storage {\n")
+      p.print("if lhs._storage !== rhs._storage {\n")
       p.indent()
       p.print("let storagesAreEqual: Bool = ")
       if storage.storageProvidesEqualTo {
-        p.print("_storage.isEqualTo(other: other._storage)\n")
+        p.print("lhs._storage.isEqualTo(other: rhs._storage)\n")
         compareFields = false
       }
     }
     if compareFields {
       generateWithLifetimeExtension(printer: &p,
-                                    alsoCapturing: "other") { p in
+                                    alsoCapturing: "rhs",
+                                    selfQualifier: "lhs") { p in
         for f in fields {
           f.generateFieldComparison(printer: &p)
         }
@@ -368,9 +378,9 @@ class MessageGenerator {
       p.outdent()
       p.print("}\n")
     }
-    p.print("if unknownFields != other.unknownFields {return false}\n")
+    p.print("if lhs.unknownFields != rhs.unknownFields {return false}\n")
     if isExtensible {
-      p.print("if _protobuf_extensionFieldValues != other._protobuf_extensionFieldValues {return false}\n")
+      p.print("if lhs._protobuf_extensionFieldValues != rhs._protobuf_extensionFieldValues {return false}\n")
     }
     p.print("return true\n")
     p.outdent()
@@ -451,6 +461,7 @@ class MessageGenerator {
     throws canThrow: Bool = false,
     returns: Bool = false,
     alsoCapturing capturedVariable: String? = nil,
+    selfQualifier qualifier: String? = nil,
     body: (inout CodePrinter) -> Void
   ) {
     if storage != nil {
@@ -458,10 +469,17 @@ class MessageGenerator {
         "\(canThrow ? "try " : "")"
       p.print(prefixKeywords)
 
+      let selfQualifier: String
+      if let qualifier = qualifier {
+        selfQualifier = "\(qualifier)."
+      } else {
+        selfQualifier = ""
+      }
+
       if let capturedVariable = capturedVariable {
         // withExtendedLifetime can only pass a single argument,
         // so we have to build and deconstruct a tuple in this case:
-        let actualArgs = "(_storage, \(capturedVariable)._storage)"
+        let actualArgs = "(\(selfQualifier)_storage, \(capturedVariable)._storage)"
         let formalArgs = "(_args: (_StorageClass, _StorageClass))"
         p.print("withExtendedLifetime(\(actualArgs)) { \(formalArgs) in\n")
         p.indent()
@@ -469,7 +487,7 @@ class MessageGenerator {
         p.print("let \(capturedVariable)_storage = _args.1\n")
       } else {
         // Single argument can be passed directly:
-        p.print("withExtendedLifetime(_storage) { (_storage: _StorageClass) in\n")
+        p.print("withExtendedLifetime(\(selfQualifier)_storage) { (_storage: _StorageClass) in\n")
         p.indent()
       }
     }
@@ -483,12 +501,37 @@ class MessageGenerator {
   }
 }
 
-fileprivate func hasSingleMessageField(descriptor: Descriptor) -> Bool {
-  let result = descriptor.fields.contains {
-    // Repeated check also rules out maps.
-    ($0.type == .message || $0.type == .group) && $0.label != .repeated
+fileprivate func hasRecursiveSingularField(descriptor: Descriptor, visited: [Descriptor] = []) -> Bool {
+  var visited = visited
+  visited.append(descriptor)
+  return descriptor.fields.contains {
+    // Ignore fields that aren’t messages or groups.
+    if $0.type != .message && $0.type != .group {
+      return false
+    }
+
+    // Repeated fields already use heap storage (for the array).
+    if $0.label == .repeated {
+      return false
+    }
+
+    guard let messageType = $0.messageType else {
+      return false
+    }
+
+    // We only care if the message or sub-message recurses to the root message.
+    if messageType === visited[0] {
+      return true
+    }
+
+    // Skip other visited fields.
+    if (visited.contains { $0 === messageType }) {
+      return false
+    }
+
+    // Examine sub-message.
+    return hasRecursiveSingularField(descriptor: messageType, visited: visited)
   }
-  return result
 }
 
 fileprivate struct MessageFieldFactory {

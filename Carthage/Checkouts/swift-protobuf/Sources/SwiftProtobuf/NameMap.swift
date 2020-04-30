@@ -23,12 +23,7 @@
 private func toJsonFieldName(_ s: String) -> String {
     var result = String()
     var capitalizeNext = false
-#if swift(>=3.2)
-    let chars = s
-#else
-    let chars = s.characters
-#endif
-    for c in chars {
+    for c in s {
         if c == "_" {
             capitalizeNext = true
         } else if capitalizeNext {
@@ -38,26 +33,24 @@ private func toJsonFieldName(_ s: String) -> String {
             result.append(String(c))
         }
     }
-    return result;
+    return result
 }
 
 /// Allocate static memory buffers to intern UTF-8
 /// string data.  Track the buffers and release all of those buffers
 /// in case we ever get deallocated.
 fileprivate class InternPool {
-  private var interned = [UnsafeBufferPointer<UInt8>]()
+  private var interned = [UnsafeRawBufferPointer]()
 
-  func intern(utf8: String.UTF8View) -> UnsafeBufferPointer<UInt8> {
-    let bytePointer = UnsafeMutablePointer<UInt8>.allocate(capacity: utf8.count)
-    let mutable = UnsafeMutableBufferPointer<UInt8>(start: bytePointer, count: utf8.count)
-    #if swift(>=3.1)
-      _ = mutable.initialize(from: utf8)
+  func intern(utf8: String.UTF8View) -> UnsafeRawBufferPointer {
+    #if swift(>=4.1)
+    let mutable = UnsafeMutableRawBufferPointer.allocate(byteCount: utf8.count,
+                                                         alignment: MemoryLayout<UInt8>.alignment)
     #else
-      for (utf8Index, mutableIndex) in zip(utf8.indices, mutable.indices) {
-        mutable[mutableIndex] = utf8[utf8Index]
-      }
+    let mutable = UnsafeMutableRawBufferPointer.allocate(count: utf8.count)
     #endif
-    let immutable = UnsafeBufferPointer<UInt8>(start: bytePointer, count: utf8.count)
+    mutable.copyBytes(from: utf8)
+    let immutable = UnsafeRawBufferPointer(mutable)
     interned.append(immutable)
     return immutable
   }
@@ -74,9 +67,11 @@ fileprivate class InternPool {
   }
 }
 
+#if !swift(>=4.2)
 // Constants for FNV hash http://tools.ietf.org/html/draft-eastlake-fnv-03
 private let i_2166136261 = Int(bitPattern: 2166136261)
 private let i_16777619 = Int(16777619)
+#endif
 
 /// An immutable bidirectional mapping between field/enum-case names
 /// and numbers, used to record field names for text-based
@@ -99,7 +94,7 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
     // This is safe to use elsewhere in this library
     internal init(staticString: StaticString) {
         self.nameString = .staticString(staticString)
-        self.utf8Buffer = UnsafeBufferPointer<UInt8>(start: staticString.utf8Start, count: staticString.utf8CodeUnitCount)
+        self.utf8Buffer = UnsafeRawBufferPointer(start: staticString.utf8Start, count: staticString.utf8CodeUnitCount)
     }
 
     // This should not be used outside of this file, as it requires
@@ -113,12 +108,12 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
 
     // This is for building a transient `Name` object sufficient for lookup purposes.
     // It MUST NOT be exposed outside of this file.
-    fileprivate init(transientUtf8Buffer: UnsafeBufferPointer<UInt8>) {
+    fileprivate init(transientUtf8Buffer: UnsafeRawBufferPointer) {
         self.nameString = .staticString("")
         self.utf8Buffer = transientUtf8Buffer
     }
 
-    private(set) var utf8Buffer: UnsafeBufferPointer<UInt8>
+    private(set) var utf8Buffer: UnsafeRawBufferPointer
 
     private enum NameString {
       case string(String)
@@ -133,6 +128,13 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
       }
     }
 
+  #if swift(>=4.2)
+    public func hash(into hasher: inout Hasher) {
+      for byte in utf8Buffer {
+        hasher.combine(byte)
+      }
+    }
+  #else  // swift(>=4.2)
     public var hashValue: Int {
       var h = i_2166136261
       for byte in utf8Buffer {
@@ -140,6 +142,7 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
       }
       return h
     }
+  #endif  // swift(>=4.2)
 
     public static func ==(lhs: Name, rhs: Name) -> Bool {
       if lhs.utf8Buffer.count != rhs.utf8Buffer.count {
@@ -250,7 +253,7 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
   ///
   /// This is used by the Text format parser to look up field or enum
   /// names using a direct reference to the un-decoded UTF8 bytes.
-  internal func number(forProtoName raw: UnsafeBufferPointer<UInt8>) -> Int? {
+  internal func number(forProtoName raw: UnsafeRawBufferPointer) -> Int? {
     let n = Name(transientUtf8Buffer: raw)
     return protoToNumberMap[n]
   }
@@ -267,7 +270,7 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
   /// original proto/text name.
   internal func number(forJSONName name: String) -> Int? {
     let utf8 = Array(name.utf8)
-    return utf8.withUnsafeBufferPointer { (buffer: UnsafeBufferPointer<UInt8>) in
+    return utf8.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
       let n = Name(transientUtf8Buffer: buffer)
       return jsonToNumberMap[n]
     }
@@ -280,7 +283,7 @@ public struct _NameMap: ExpressibleByDictionaryLiteral {
   /// required no special processing.  As a result, we can avoid
   /// copying the name and look up the number using a direct reference
   /// to the un-decoded UTF8 bytes.
-  internal func number(forJSONName raw: UnsafeBufferPointer<UInt8>) -> Int? {
+  internal func number(forJSONName raw: UnsafeRawBufferPointer) -> Int? {
     let n = Name(transientUtf8Buffer: raw)
     return jsonToNumberMap[n]
   }
