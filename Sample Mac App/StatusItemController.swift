@@ -77,7 +77,7 @@ class StatusItemController: NSObject {
         scanner.reset()
     }
 
-    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         return true
     }
 }
